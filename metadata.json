@@ -1,0 +1,6 @@
+{
+  "name": "SentinelMail ML — E-Mail Spam Detection System",
+  "description": "Production full-stack E-Mail Spam Detection System powered by TF-IDF NLP preprocessing, Multinomial Naive Bayes, Logistic Regression, and calibrated Linear SVM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
