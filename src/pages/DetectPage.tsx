@@ -3,17 +3,30 @@ import { motion } from 'motion/react';
 import {
   AlertTriangle,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Download,
   Eraser,
+  FileJson,
   FileSpreadsheet,
+  Flag,
   Link2,
   Loader2,
+  Printer,
   ScanSearch,
   ShieldAlert,
   ShieldCheck,
+  SlidersHorizontal,
+  X,
 } from 'lucide-react';
-import { BatchPredictionResponse, mlApi, PredictionRecord } from '../services/api';
+import {
+  BatchPredictionResponse,
+  feedbackApi,
+  HeaderAuthStatus,
+  mlApi,
+  PredictionRecord,
+} from '../services/api';
 import { VerdictLabel } from '../components/VerdictLabel';
 
 const SAMPLE_EMAILS = [
@@ -42,6 +55,29 @@ URGENT: PayPal Account Limited | alert@paypal-security.xyz | Verify your credit 
 Q3 Architecture Review Notes | priya@engineering.org | Hi team, Thursday architecture meeting is moved to 3:30 PM PST after the PostgreSQL migration test.
 Double Your Bitcoin in 48h | vip@crypto-wealth.biz | Guaranteed 300% ROI! Deposit $250 today for risk-free automated payouts.
 CS-410 Assignment Reminder | prof.chen@university.edu | Please submit your TF-IDF Jupyter notebook and confusion matrix report before Friday 11:59 PM.`;
+
+const SPOOFED_HEADER_SAMPLE = `From: Finance Executive <cfo-office@acme-corp.com>
+Reply-To: wire-desk@offshore-settlement.xyz
+Return-Path: <bounce99@unknown-relay.ru>
+Received: from relay4.unknown-relay.ru (198.51.100.44) by mx.mailguard.local with ESMTP
+Received: from host2.spoofnet.biz (203.0.113.81) by relay4.unknown-relay.ru
+Authentication-Results: mx.mailguard.local; spf=fail smtp.mailfrom=unknown-relay.ru; dkim=fail header.d=acme-corp.com; dmarc=fail action=quarantine header.from=acme-corp.com
+Received-SPF: fail (mx.mailguard.local: domain of acme-corp.com does not designate 198.51.100.44 as permitted sender)`;
+
+const VALID_HEADER_SAMPLE = `From: GitHub Notifications <notifications@github.com>
+Reply-To: noreply@github.com
+Return-Path: <noreply@github.com>
+Received: from smtp.github.com (192.30.252.192) by mx.mailguard.local with ESMTPS
+DKIM-Signature: v=1; a=rsa-sha256; d=github.com; s=pf2023; bh=k29dk10a==; b=sigOk9912==
+Authentication-Results: mx.mailguard.local; spf=pass smtp.mailfrom=github.com; dkim=pass header.d=github.com; dmarc=pass action=none header.from=github.com
+Received-SPF: pass (mx.mailguard.local: domain of github.com designates 192.30.252.192 as permitted sender)`;
+
+function authStatusClass(status: HeaderAuthStatus | 'warn'): string {
+  if (status === 'pass') return 'text-emerald-400';
+  if (status === 'fail') return 'text-rose-400';
+  if (status === 'softfail' || status === 'warn') return 'text-amber-300';
+  return 'text-slate-400';
+}
 
 function parseBatchInput(raw: string): Array<{ subject: string; sender: string; body: string }> {
   const lines = raw
@@ -92,10 +128,20 @@ export function DetectPage() {
   const [subject, setSubject] = useState('');
   const [sender, setSender] = useState('');
   const [body, setBody] = useState('');
+  const [rawHeaders, setRawHeaders] = useState('');
+  const [showHeaders, setShowHeaders] = useState(false);
+  const [useEnsemble, setUseEnsemble] = useState(false);
+  const [threshold, setThreshold] = useState(0.5);
   const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<PredictionRecord | null>(null);
+  const [lastSubmittedBody, setLastSubmittedBody] = useState('');
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+
+  // Active Learning & Brief Modal state
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState('');
+  const [showPrintBrief, setShowPrintBrief] = useState(false);
 
   // Batch scanner state
   const [batchRaw, setBatchRaw] = useState('');
@@ -106,6 +152,7 @@ export function DetectPage() {
   const handleAnalyze = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setFeedbackMessage('');
 
     if (!subject.trim() && !body.trim()) {
       setError('Please enter an email subject or body text to analyze.');
@@ -114,11 +161,16 @@ export function DetectPage() {
 
     setAnalyzing(true);
     try {
+      const content = body.trim() || subject.trim();
       const { data } = await mlApi.predict({
         subject: subject.trim(),
         sender: sender.trim() || undefined,
         body: body.trim(),
+        raw_headers: rawHeaders.trim() || undefined,
+        use_ensemble: useEnsemble,
+        threshold,
       });
+      setLastSubmittedBody(content);
       setResult(data);
     } catch (err: unknown) {
       const msg =
@@ -134,7 +186,9 @@ export function DetectPage() {
     setSubject('');
     setSender('');
     setBody('');
+    setRawHeaders('');
     setError('');
+    setFeedbackMessage('');
     setResult(null);
   };
 
@@ -143,6 +197,66 @@ export function DetectPage() {
     setSender(sample.sender);
     setBody(sample.body);
     setError('');
+    setFeedbackMessage('');
+  };
+
+  const handleFlagMisclassification = async () => {
+    if (!result || feedbackSubmitting) return;
+    const correctedLabel: 'SPAM' | 'HAM' = result.prediction === 'SPAM' ? 'HAM' : 'SPAM';
+    setFeedbackSubmitting(true);
+    setFeedbackMessage('');
+    try {
+      await feedbackApi.submit({
+        prediction_id: result.id,
+        email_subject: result.email_subject,
+        sender_address: result.sender_address,
+        email_content: lastSubmittedBody || body.trim() || result.email_subject,
+        original_prediction: result.prediction,
+        corrected_label: correctedLabel,
+        notes: `Flagged from Detection Workspace (${result.classifier_mode || result.model_name}, threshold ${(result.threshold_used ?? threshold).toFixed(2)})`,
+      });
+      setFeedbackMessage(
+        `Queued for Active Learning: corrected ${result.prediction} -> ${correctedLabel}.`
+      );
+    } catch {
+      setError('Failed to submit Active Learning feedback.');
+    } finally {
+      setFeedbackSubmitting(false);
+    }
+  };
+
+  const handleExportJson = () => {
+    if (!result) return;
+    const report = {
+      generated_at: new Date().toISOString(),
+      platform: 'MailGuard AI Enterprise SOC',
+      record_id: result.id,
+      email_subject: result.email_subject,
+      sender_address: result.sender_address,
+      verdict: result.prediction,
+      threat_category: result.threat_category,
+      spam_probability: result.spam_probability,
+      ensemble_probability: result.ensemble_probability,
+      confidence_score: result.confidence_score,
+      classifier_mode: result.classifier_mode,
+      model_name: result.model_name,
+      threshold_used: result.threshold_used,
+      processing_time_ms: result.processing_time,
+      header_analysis: result.header_analysis,
+      risk_indicators: result.risk_indicators,
+      model_breakdown: result.model_breakdown,
+      suspicious_keywords: result.suspicious_keywords,
+      sentence_analysis: result.sentence_analysis,
+      ai_advisory: result.ai_advisory,
+      suggested_replies: result.suggested_replies,
+    };
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mailguard_forensics_${result.id.slice(0, 8)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleCopyReply = async (text: string, idx: number) => {
@@ -327,12 +441,120 @@ export function DetectPage() {
                 </label>
                 <textarea
                   id="body"
-                  rows={10}
+                  rows={8}
                   value={body}
                   onChange={(e) => setBody(e.target.value)}
                   placeholder="Paste the email content you want to classify..."
                   className="w-full px-3.5 py-3 rounded-lg bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 leading-relaxed resize-y"
                 />
+              </div>
+
+              {/* Classifier Mode & Decision Threshold Controls */}
+              <div className="p-4 rounded-lg bg-slate-950/70 border border-slate-800 space-y-3.5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 text-xs font-medium text-slate-300">
+                    <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Inference Engine &amp; Threshold</span>
+                  </div>
+                  <div className="inline-flex items-center gap-1 p-0.5 rounded-md bg-slate-900 border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setUseEnsemble(false)}
+                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                        !useEnsemble ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Best Model
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setUseEnsemble(true)}
+                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition-colors whitespace-nowrap ${
+                        useEnsemble ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Soft-Voting Ensemble
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">SPAM Decision Threshold</span>
+                    <span className="font-mono text-indigo-300 font-semibold tabular-nums">
+                      {(threshold * 100).toFixed(0)}% ({threshold.toFixed(2)})
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.1}
+                    max={0.9}
+                    step={0.05}
+                    value={threshold}
+                    onChange={(e) => setThreshold(Number(e.target.value))}
+                    aria-label="Spam classification threshold"
+                    className="w-full accent-indigo-500 cursor-pointer"
+                  />
+                  <div className="flex justify-between text-[11px] text-slate-500 font-mono">
+                    <span>0.10 (Strict Quarantine)</span>
+                    <span>0.50 (Balanced)</span>
+                    <span>0.90 (High Precision)</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Collapsible Raw SMTP Headers Forensics Input */}
+              <div className="border border-slate-800 rounded-lg bg-slate-950/60 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowHeaders((prev) => !prev)}
+                  className="w-full px-4 py-2.5 flex items-center justify-between text-xs font-medium text-slate-300 hover:bg-slate-900/60 transition-colors"
+                >
+                  <span>
+                    Raw Email Headers — SPF / DKIM / DMARC Forensics {rawHeaders.trim() ? '· Attached' : '(Optional)'}
+                  </span>
+                  {showHeaders ? (
+                    <ChevronUp className="w-4 h-4 text-slate-400" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4 text-slate-400" />
+                  )}
+                </button>
+                {showHeaders && (
+                  <div className="px-4 pb-4 pt-2 border-t border-slate-800 space-y-2.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setRawHeaders(SPOOFED_HEADER_SAMPLE)}
+                        className="px-2.5 py-1 rounded bg-rose-950/40 hover:bg-rose-950/70 border border-rose-500/30 text-[11px] text-rose-200 whitespace-nowrap"
+                      >
+                        Load Spoofed BEC Headers
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRawHeaders(VALID_HEADER_SAMPLE)}
+                        className="px-2.5 py-1 rounded bg-emerald-950/40 hover:bg-emerald-950/70 border border-emerald-500/30 text-[11px] text-emerald-200 whitespace-nowrap"
+                      >
+                        Load Valid Authenticated Headers
+                      </button>
+                      {rawHeaders && (
+                        <button
+                          type="button"
+                          onClick={() => setRawHeaders('')}
+                          className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-[11px] text-slate-300 whitespace-nowrap"
+                        >
+                          Clear Headers
+                        </button>
+                      )}
+                    </div>
+                    <textarea
+                      rows={5}
+                      value={rawHeaders}
+                      onChange={(e) => setRawHeaders(e.target.value)}
+                      placeholder="Paste Authentication-Results, Received-SPF, DKIM-Signature, Reply-To, and Return-Path headers..."
+                      className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-[11px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500 leading-relaxed"
+                    />
+                  </div>
+                )}
               </div>
 
               <div className="flex flex-wrap items-center gap-3 pt-1">
@@ -369,15 +591,52 @@ export function DetectPage() {
 
           {/* Classification & AI Intelligence Result Panel */}
           <div className="lg:col-span-6 bg-slate-900/75 backdrop-blur-md border border-slate-800 rounded-xl p-6 space-y-5">
-            <h2 className="font-display text-lg font-semibold text-white">
-              Classification &amp; AI Threat Forensics
-            </h2>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="font-display text-lg font-semibold text-white">
+                Classification &amp; AI Threat Forensics
+              </h2>
+              {result && !analyzing && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleFlagMisclassification}
+                    disabled={feedbackSubmitting}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-amber-200 bg-amber-950/40 hover:bg-amber-950/70 border border-amber-500/30 transition-colors whitespace-nowrap"
+                  >
+                    <Flag className="w-3.5 h-3.5" />
+                    <span>Mark as {result.prediction === 'SPAM' ? 'HAM' : 'SPAM'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExportJson}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-200 bg-slate-950 hover:bg-slate-800 border border-slate-800 transition-colors whitespace-nowrap"
+                  >
+                    <FileJson className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Export JSON</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowPrintBrief(true)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium text-slate-200 bg-slate-950 hover:bg-slate-800 border border-slate-800 transition-colors whitespace-nowrap"
+                  >
+                    <Printer className="w-3.5 h-3.5 text-slate-300" />
+                    <span>Printable Brief</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {feedbackMessage && (
+              <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/35 text-xs text-emerald-200">
+                {feedbackMessage}
+              </div>
+            )}
 
             {!result && !analyzing && (
               <div className="py-16 text-center space-y-2 border border-dashed border-slate-800 rounded-lg px-4">
                 <p className="text-sm text-slate-300">Ready for real-time inference</p>
                 <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                  Enter an email on the left or pick a sample case to inspect ML consensus, threat category, domain spoofing, and sentence-level risk scoring.
+                  Enter an email on the left or pick a sample case to inspect ML consensus, SPF/DKIM/DMARC headers, domain spoofing, and sentence-level risk scoring.
                 </p>
               </div>
             )}
@@ -411,7 +670,18 @@ export function DetectPage() {
                     </span>
                   </div>
                   <p className="mt-2 text-xs text-slate-300">
-                    Classified by <span className="font-semibold text-white">{result.model_name}</span> and saved to prediction history.
+                    Classified by <span className="font-semibold text-white">{result.model_name}</span> at threshold{' '}
+                    <span className="font-mono text-white tabular-nums">
+                      {((result.threshold_used ?? threshold) * 100).toFixed(0)}%
+                    </span>
+                    {typeof result.ensemble_probability === 'number' && (
+                      <span>
+                        {' '}· Ensemble Score{' '}
+                        <span className="font-mono text-indigo-300 tabular-nums">
+                          {(result.ensemble_probability * 100).toFixed(1)}%
+                        </span>
+                      </span>
+                    )}
                   </p>
                 </div>
 
@@ -442,6 +712,54 @@ export function DetectPage() {
                     </p>
                   </div>
                 </div>
+
+                {/* Email Header SPF / DKIM / DMARC Forensics */}
+                {result.header_analysis?.hasHeaders && (
+                  <div className="p-4 rounded-lg bg-slate-950/80 border border-slate-800 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-semibold text-white">
+                        SMTP Header Authentication Forensics
+                      </p>
+                      <span className="text-xs font-mono text-slate-300 tabular-nums">
+                        Header Risk {result.header_analysis.headerRiskScore}/100 · {result.header_analysis.hopCount} Hops
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2 text-xs">
+                      <div className="p-2.5 rounded bg-slate-900/90 border border-slate-800">
+                        <p className="text-slate-500">SPF</p>
+                        <p className={`mt-0.5 font-mono font-semibold uppercase ${authStatusClass(result.header_analysis.spf)}`}>
+                          {result.header_analysis.spf}
+                        </p>
+                      </div>
+                      <div className="p-2.5 rounded bg-slate-900/90 border border-slate-800">
+                        <p className="text-slate-500">DKIM</p>
+                        <p className={`mt-0.5 font-mono font-semibold uppercase ${authStatusClass(result.header_analysis.dkim)}`}>
+                          {result.header_analysis.dkim}
+                        </p>
+                      </div>
+                      <div className="p-2.5 rounded bg-slate-900/90 border border-slate-800">
+                        <p className="text-slate-500">DMARC</p>
+                        <p className={`mt-0.5 font-mono font-semibold uppercase ${authStatusClass(result.header_analysis.dmarc)}`}>
+                          {result.header_analysis.dmarc}
+                        </p>
+                      </div>
+                    </div>
+
+                    {result.header_analysis.findings.length > 0 && (
+                      <div className="space-y-1.5 text-xs">
+                        {result.header_analysis.findings.map((finding, idx) => (
+                          <div key={idx} className="flex items-start justify-between gap-3 text-slate-300">
+                            <span>{finding.detail}</span>
+                            <span className={`font-mono uppercase shrink-0 ${authStatusClass(finding.status)}`}>
+                              {finding.status}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {/* AI Security Advisory */}
                 {result.ai_advisory && (
@@ -789,6 +1107,114 @@ export function DetectPage() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Printable Executive Threat Forensics Brief Modal */}
+      {showPrintBrief && result && (
+        <div className="print-brief-modal fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="print-brief-surface max-w-2xl w-full bg-[#0D1326] border border-slate-800 rounded-xl p-6 space-y-5 max-h-[88vh] overflow-y-auto">
+            <div className="flex items-start justify-between gap-4 border-b border-slate-800 pb-4">
+              <div>
+                <p className="text-xs font-mono text-indigo-400 uppercase tracking-wider">
+                  MailGuard AI · SOC Threat Forensics Brief
+                </p>
+                <h3 className="mt-1 font-display text-lg font-semibold text-white">
+                  {result.email_subject}
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Sender: {result.sender_address || 'Unspecified'} · Record {result.id.slice(0, 8)} ·{' '}
+                  {new Date(result.created_at).toLocaleString()}
+                </p>
+              </div>
+              <div className="no-print flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  <span>Print / PDF</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowPrintBrief(false)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white"
+                  aria-label="Close forensics brief"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+              <div className="p-3 rounded-lg border border-slate-800 bg-slate-950/60">
+                <p className="text-slate-400">Verdict</p>
+                <p className="mt-1 font-mono text-base font-bold text-white">{result.prediction}</p>
+              </div>
+              <div className="p-3 rounded-lg border border-slate-800 bg-slate-950/60">
+                <p className="text-slate-400">Spam Prob.</p>
+                <p className="mt-1 font-mono text-base font-bold text-white tabular-nums">
+                  {(result.spam_probability * 100).toFixed(2)}%
+                </p>
+              </div>
+              <div className="p-3 rounded-lg border border-slate-800 bg-slate-950/60">
+                <p className="text-slate-400">Threshold</p>
+                <p className="mt-1 font-mono text-base font-bold text-white tabular-nums">
+                  {((result.threshold_used ?? threshold) * 100).toFixed(0)}%
+                </p>
+              </div>
+              <div className="p-3 rounded-lg border border-slate-800 bg-slate-950/60">
+                <p className="text-slate-400">Urgency Index</p>
+                <p className="mt-1 font-mono text-base font-bold text-white tabular-nums">
+                  {result.risk_indicators?.urgencyScore ?? 0}/100
+                </p>
+              </div>
+            </div>
+
+            {result.ai_advisory && (
+              <div className="space-y-1 text-xs">
+                <p className="font-semibold text-slate-300">Executive Advisory</p>
+                <p className="text-slate-300 leading-relaxed">{result.ai_advisory}</p>
+              </div>
+            )}
+
+            {result.header_analysis?.hasHeaders && (
+              <div className="space-y-1.5 text-xs">
+                <p className="font-semibold text-slate-300">Header Authentication Summary</p>
+                <p className="font-mono text-slate-300">
+                  SPF: {result.header_analysis.spf.toUpperCase()} · DKIM: {result.header_analysis.dkim.toUpperCase()} · DMARC:{' '}
+                  {result.header_analysis.dmarc.toUpperCase()} · Hops: {result.header_analysis.hopCount} · Reply-To Mismatch:{' '}
+                  {result.header_analysis.replyToMismatch ? 'YES' : 'NO'}
+                </p>
+              </div>
+            )}
+
+            {result.model_breakdown && (
+              <div className="space-y-1.5 text-xs">
+                <p className="font-semibold text-slate-300">Classifier Consensus</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {result.model_breakdown.map((m) => (
+                    <div key={m.modelName} className="flex justify-between border border-slate-800 rounded px-3 py-1.5">
+                      <span>{m.modelName}</span>
+                      <span className="font-mono tabular-nums">
+                        {m.prediction} ({(m.spamProbability * 100).toFixed(1)}%)
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {result.suspicious_keywords.length > 0 && (
+              <div className="space-y-1.5 text-xs">
+                <p className="font-semibold text-slate-300">Top TF-IDF Indicators</p>
+                <p className="font-mono text-slate-300">
+                  {result.suspicious_keywords.map((k) => `${k.term} (+${k.weight.toFixed(3)})`).join(' · ')}
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

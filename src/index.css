@@ -45,3 +45,36 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #334155;
 }
+
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-brief-modal {
+    position: static !important;
+    inset: auto !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  .print-brief-surface {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    border: 1px solid #cbd5e1 !important;
+    box-shadow: none !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  .print-brief-surface * {
+    color: #0f172a !important;
+    border-color: #cbd5e1 !important;
+  }
+}

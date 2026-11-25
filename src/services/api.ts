@@ -89,6 +89,72 @@ export interface BatchPredictionResponse {
   results: BatchPredictionItem[];
 }
 
+export interface RocPoint {
+  threshold: number;
+  fpr: number;
+  tpr: number;
+  tp: number;
+  fp: number;
+  tn: number;
+  fn: number;
+  precision: number;
+  recall: number;
+  f1: number;
+  accuracy: number;
+}
+
+export interface ModelRocCurve {
+  modelName: string;
+  rocAuc: number;
+  points: RocPoint[];
+}
+
+export interface FeatureWeightItem {
+  term: string;
+  spamWeight: number;
+  lrWeight: number;
+  svmWeight: number;
+  nbLogOdds: number;
+  polarity: 'spam' | 'ham';
+}
+
+export interface EnsembleEvaluation {
+  modelName: 'Soft-Voting Ensemble';
+  weights: {
+    naiveBayes: number;
+    logisticRegression: number;
+    linearSvm: number;
+  };
+  accuracy: number;
+  precisionScore: number;
+  recallScore: number;
+  f1Score: number;
+  rocAuc: number;
+  confusionMatrix: [[number, number], [number, number]];
+  calibrationNote: string;
+}
+
+export type HeaderAuthStatus = 'pass' | 'fail' | 'softfail' | 'neutral' | 'missing';
+
+export interface HeaderAnalysis {
+  hasHeaders: boolean;
+  spf: HeaderAuthStatus;
+  dkim: HeaderAuthStatus;
+  dmarc: HeaderAuthStatus;
+  fromAddress: string | null;
+  replyToAddress: string | null;
+  returnPathAddress: string | null;
+  replyToMismatch: boolean;
+  returnPathMismatch: boolean;
+  hopCount: number;
+  headerRiskScore: number;
+  findings: Array<{
+    check: string;
+    status: HeaderAuthStatus | 'warn';
+    detail: string;
+  }>;
+}
+
 export interface PredictionRecord {
   id: string;
   user_id?: string;
@@ -97,8 +163,11 @@ export interface PredictionRecord {
   email_content?: string;
   prediction: 'SPAM' | 'HAM';
   spam_probability: number;
+  ensemble_probability?: number;
   confidence_score: number;
   model_name: string;
+  classifier_mode?: 'Active Best Model' | 'Soft-Voting Ensemble';
+  threshold_used?: number;
   processing_time: number;
   suspicious_keywords: SuspiciousKeyword[];
   preprocessed_tokens?: string[];
@@ -109,6 +178,7 @@ export interface PredictionRecord {
   }>;
   threat_category?: ThreatCategory;
   risk_indicators?: RiskIndicators;
+  header_analysis?: HeaderAnalysis;
   sentence_analysis?: SentenceRisk[];
   ai_advisory?: string;
   suggested_replies?: string[];
@@ -182,8 +252,14 @@ export const authApi = {
 };
 
 export const mlApi = {
-  predict: (payload: { subject: string; sender?: string; body: string }) =>
-    apiClient.post<PredictionRecord>('/api/predict', payload),
+  predict: (payload: {
+    subject: string;
+    sender?: string;
+    body: string;
+    raw_headers?: string;
+    use_ensemble?: boolean;
+    threshold?: number;
+  }) => apiClient.post<PredictionRecord>('/api/predict', payload),
   predictBatch: (emails: Array<{ id?: string; subject?: string; sender?: string; body: string }>) =>
     apiClient.post<BatchPredictionResponse>('/api/predict/batch', { emails }),
   getModelInfo: () => apiClient.get<ModelInfoResponse>('/api/model/info'),
@@ -192,8 +268,87 @@ export const mlApi = {
       selected_model: string;
       dataset_stats: ModelInfoResponse['dataset'];
       metrics: ModelMetricRow[];
+      ensemble_evaluation: EnsembleEvaluation;
+      roc_curves: ModelRocCurve[];
+      feature_importance: {
+        topSpam: FeatureWeightItem[];
+        topHam: FeatureWeightItem[];
+      };
     }>('/api/model/metrics'),
+  getRocCurves: () =>
+    apiClient.get<{
+      selected_model: string;
+      ensemble_evaluation: EnsembleEvaluation;
+      roc_curves: ModelRocCurve[];
+    }>('/api/model/roc'),
+  getFeatures: (q = '', limit = 15) =>
+    apiClient.get<{
+      query: string;
+      vocab_size: number;
+      total_matches: number;
+      top_spam: FeatureWeightItem[];
+      top_ham: FeatureWeightItem[];
+    }>('/api/model/features', { params: { q, limit } }),
   retrain: () => apiClient.post('/api/model/retrain'),
+};
+
+export interface FeedbackSample {
+  id: string;
+  prediction_id: string | null;
+  submitted_by: string | null;
+  submitted_by_name?: string | null;
+  submitted_by_email?: string | null;
+  email_subject: string;
+  sender_address: string | null;
+  email_content: string;
+  original_prediction: 'SPAM' | 'HAM';
+  corrected_label: 'SPAM' | 'HAM';
+  notes: string | null;
+  status: 'pending' | 'applied' | 'dismissed';
+  created_at: string;
+  applied_at: string | null;
+}
+
+export interface RetrainFeedbackResponse {
+  message: string;
+  applied_count: number;
+  total_feedback_used: number;
+  before: {
+    selected_model: string;
+    accuracy: number;
+    f1_score: number;
+    roc_auc: number;
+    total_records: number;
+  };
+  after: {
+    selected_model: string;
+    accuracy: number;
+    f1_score: number;
+    roc_auc: number;
+    total_records: number;
+  };
+  selected_model: string;
+}
+
+export const feedbackApi = {
+  submit: (payload: {
+    prediction_id?: string | null;
+    email_subject: string;
+    sender_address?: string | null;
+    email_content: string;
+    original_prediction: 'SPAM' | 'HAM';
+    corrected_label: 'SPAM' | 'HAM';
+    notes?: string;
+  }) =>
+    apiClient.post<{ feedback: FeedbackSample; message: string }>('/api/feedback', payload),
+  list: (status?: 'ALL' | 'pending' | 'applied' | 'dismissed') =>
+    apiClient.get<{
+      items: FeedbackSample[];
+      counts: { pending: number; applied: number; dismissed: number };
+    }>('/api/feedback', { params: status && status !== 'ALL' ? { status } : undefined }),
+  update: (id: string, payload: { status?: 'pending' | 'applied' | 'dismissed'; corrected_label?: 'SPAM' | 'HAM' }) =>
+    apiClient.patch<{ feedback: FeedbackSample }>(`/api/feedback/${id}`, payload),
+  retrain: () => apiClient.post<RetrainFeedbackResponse>('/api/feedback/retrain'),
 };
 
 export const historyApi = {

@@ -17,11 +17,13 @@ import {
   predictBatchWithPipeline,
   predictEmailWithPipeline,
   savePipeline,
+  searchVocabularyWeights,
   trainPipelineFromRows,
 } from './mlEngine.ts';
 import nodemailer from 'nodemailer';
 import {
   DbDataset,
+  DbFeedbackSample,
   DbMailMessage,
   DbModelMetric,
   DbPrediction,
@@ -361,6 +363,30 @@ export function createApp(options?: {
       selected_model: pipeline.selectedModel,
       dataset_stats: pipeline.datasetStats,
       metrics: formatted,
+      ensemble_evaluation: pipeline.ensembleEvaluation,
+      roc_curves: pipeline.rocCurves,
+      feature_importance: pipeline.featureImportance,
+    });
+  });
+
+  app.get('/api/model/roc', (_req: Request, res: Response) => {
+    res.json({
+      selected_model: pipeline.selectedModel,
+      ensemble_evaluation: pipeline.ensembleEvaluation,
+      roc_curves: pipeline.rocCurves,
+    });
+  });
+
+  app.get('/api/model/features', (req: Request, res: Response) => {
+    const query = String(req.query.q ?? '').trim();
+    const limit = Math.min(30, Math.max(5, Number.parseInt(String(req.query.limit ?? '15'), 10) || 15));
+    const weights = searchVocabularyWeights(pipeline, query, limit);
+    res.json({
+      query,
+      vocab_size: pipeline.datasetStats.vocabSize,
+      total_matches: weights.totalMatches,
+      top_spam: weights.topSpam,
+      top_ham: weights.topHam,
     });
   });
 
@@ -394,23 +420,34 @@ export function createApp(options?: {
     const subject = typeof req.body?.subject === 'string' ? req.body.subject.trim() : '';
     const sender = typeof req.body?.sender === 'string' ? req.body.sender.trim() : '';
     const body = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+    const rawHeaders = typeof req.body?.raw_headers === 'string' ? req.body.raw_headers.trim() : '';
+    const useEnsemble = Boolean(req.body?.use_ensemble);
+    const threshold =
+      typeof req.body?.threshold === 'number' && Number.isFinite(req.body.threshold)
+        ? req.body.threshold
+        : undefined;
 
     if (!subject && !body) {
       res.status(400).json({ detail: 'Please provide an email subject or message body.' });
       return;
     }
 
-    if (body.length > 50_000 || subject.length > 1000) {
+    if (body.length > 50_000 || subject.length > 1000 || rawHeaders.length > 30_000) {
       res.status(400).json({ detail: 'Email content exceeds maximum allowed length.' });
       return;
     }
 
     try {
-      const result = predictEmailWithPipeline(pipeline, subject, body, sender);
+      const result = predictEmailWithPipeline(pipeline, subject, body, sender, {
+        rawHeaders: rawHeaders || undefined,
+        useEnsemble,
+        threshold,
+      });
       const id = crypto.randomUUID();
       const createdAt = new Date().toISOString();
       const storedSubject = subject || '(No Subject)';
       const storedContent = body || subject;
+      const storedSender = sender || result.headerAnalysis.fromAddress || null;
 
       db.prepare(`
         INSERT INTO email_predictions (
@@ -422,7 +459,7 @@ export function createApp(options?: {
         id,
         req.user!.id,
         storedSubject,
-        sender || null,
+        storedSender,
         storedContent,
         result.prediction,
         result.spamProbability,
@@ -437,23 +474,27 @@ export function createApp(options?: {
         db,
         req.user!.id,
         'EMAIL_PREDICTION',
-        `Classified "${storedSubject.slice(0, 60)}" as ${result.prediction} (${(result.spamProbability * 100).toFixed(1)}%)`
+        `Classified "${storedSubject.slice(0, 60)}" as ${result.prediction} (${(result.spamProbability * 100).toFixed(1)}%, ${result.classifierMode})`
       );
 
       res.status(201).json({
         id,
         email_subject: storedSubject,
-        sender_address: sender || null,
+        sender_address: storedSender,
         prediction: result.prediction,
         spam_probability: result.spamProbability,
+        ensemble_probability: result.ensembleProbability,
         confidence_score: result.confidenceScore,
         model_name: result.modelName,
+        classifier_mode: result.classifierMode,
+        threshold_used: result.thresholdUsed,
         processing_time: result.processingTimeMs,
         suspicious_keywords: result.suspiciousKeywords,
         preprocessed_tokens: result.preprocessedTokens,
         model_breakdown: result.modelBreakdown,
         threat_category: result.threatCategory,
         risk_indicators: result.riskIndicators,
+        header_analysis: result.headerAnalysis,
         sentence_analysis: result.sentenceAnalysis,
         ai_advisory: result.aiAdvisory,
         suggested_replies: result.suggestedReplies,
@@ -1352,6 +1393,241 @@ export function createApp(options?: {
     }
     db.prepare('DELETE FROM mail_messages WHERE id = ?').run(msg.id);
     res.json({ deleted: true, id: msg.id });
+  });
+
+  // =========================================================================
+  // ACTIVE LEARNING FEEDBACK & MODEL RETRAINING ROUTES
+  // =========================================================================
+  app.post('/api/feedback', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const predictionId =
+      typeof req.body?.prediction_id === 'string' && req.body.prediction_id.trim()
+        ? req.body.prediction_id.trim()
+        : null;
+    const emailSubject = String(req.body?.email_subject ?? req.body?.subject ?? '(No Subject)').trim();
+    const senderAddress =
+      typeof req.body?.sender_address === 'string' && req.body.sender_address.trim()
+        ? req.body.sender_address.trim()
+        : typeof req.body?.sender === 'string' && req.body.sender.trim()
+          ? req.body.sender.trim()
+          : null;
+    const emailContent = String(req.body?.email_content ?? req.body?.body ?? '').trim();
+    const originalPrediction = String(req.body?.original_prediction ?? '').toUpperCase();
+    const correctedLabel = String(req.body?.corrected_label ?? '').toUpperCase();
+    const notes = typeof req.body?.notes === 'string' ? req.body.notes.trim() : null;
+
+    if (!emailContent) {
+      res.status(400).json({ detail: 'Email content is required to submit a feedback sample.' });
+      return;
+    }
+    if (
+      (originalPrediction !== 'SPAM' && originalPrediction !== 'HAM') ||
+      (correctedLabel !== 'SPAM' && correctedLabel !== 'HAM')
+    ) {
+      res.status(400).json({ detail: 'Both original_prediction and corrected_label must be SPAM or HAM.' });
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO feedback_samples (
+        id, prediction_id, submitted_by, email_subject, sender_address,
+        email_content, original_prediction, corrected_label, notes, status, created_at, applied_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
+    `).run(
+      id,
+      predictionId,
+      req.user!.id,
+      emailSubject || '(No Subject)',
+      senderAddress,
+      emailContent,
+      originalPrediction,
+      correctedLabel,
+      notes,
+      createdAt
+    );
+
+    logActivity(
+      db,
+      req.user!.id,
+      'FEEDBACK_SUBMITTED',
+      `Flagged "${emailSubject.slice(0, 50)}" (${originalPrediction} -> ${correctedLabel}) for Active Learning`
+    );
+
+    const saved = db.prepare('SELECT * FROM feedback_samples WHERE id = ?').get(id) as unknown as DbFeedbackSample;
+    res.status(201).json({
+      feedback: saved,
+      message: 'Correction queued for Active Learning retraining.',
+    });
+  });
+
+  app.get('/api/feedback', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const statusFilter = String(req.query.status ?? 'ALL').toLowerCase();
+    const isAdmin = req.user!.role === 'admin';
+
+    const conditions: string[] = [];
+    const params: string[] = [];
+
+    if (!isAdmin) {
+      conditions.push('f.submitted_by = ?');
+      params.push(req.user!.id);
+    }
+    if (statusFilter === 'pending' || statusFilter === 'applied' || statusFilter === 'dismissed') {
+      conditions.push('f.status = ?');
+      params.push(statusFilter);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = db
+      .prepare(`
+        SELECT f.*, u.full_name as submitted_by_name, u.email as submitted_by_email
+        FROM feedback_samples f
+        LEFT JOIN users u ON f.submitted_by = u.id
+        ${whereClause}
+        ORDER BY f.created_at DESC
+        LIMIT 100
+      `)
+      .all(...params);
+
+    const summary = db
+      .prepare(`
+        SELECT
+          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+          SUM(CASE WHEN status = 'applied' THEN 1 ELSE 0 END) as applied_count,
+          SUM(CASE WHEN status = 'dismissed' THEN 1 ELSE 0 END) as dismissed_count
+        FROM feedback_samples
+      `)
+      .get() as {
+      pending_count: number | null;
+      applied_count: number | null;
+      dismissed_count: number | null;
+    };
+
+    res.json({
+      items: rows,
+      counts: {
+        pending: summary.pending_count || 0,
+        applied: summary.applied_count || 0,
+        dismissed: summary.dismissed_count || 0,
+      },
+    });
+  });
+
+  app.patch('/api/feedback/:id', requireAuth, requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    const targetId = String(req.params.id);
+    const existing = db
+      .prepare('SELECT * FROM feedback_samples WHERE id = ?')
+      .get(targetId) as DbFeedbackSample | undefined;
+
+    if (!existing) {
+      res.status(404).json({ detail: 'Feedback sample not found.' });
+      return;
+    }
+
+    const nextStatus = req.body?.status ? String(req.body.status).toLowerCase() : existing.status;
+    const nextLabel = req.body?.corrected_label
+      ? String(req.body.corrected_label).toUpperCase()
+      : existing.corrected_label;
+
+    if (!['pending', 'applied', 'dismissed'].includes(nextStatus)) {
+      res.status(400).json({ detail: 'Status must be pending, applied, or dismissed.' });
+      return;
+    }
+    if (nextLabel !== 'SPAM' && nextLabel !== 'HAM') {
+      res.status(400).json({ detail: 'corrected_label must be SPAM or HAM.' });
+      return;
+    }
+
+    db.prepare('UPDATE feedback_samples SET status = ?, corrected_label = ? WHERE id = ?').run(
+      nextStatus,
+      nextLabel,
+      targetId
+    );
+
+    const updated = db.prepare('SELECT * FROM feedback_samples WHERE id = ?').get(targetId) as unknown as DbFeedbackSample;
+    res.json({ feedback: updated });
+  });
+
+  app.post('/api/feedback/retrain', requireAuth, requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const beforeBest =
+        pipeline.evaluations.find((e) => e.isSelected) || pipeline.evaluations[0];
+      const beforeSnapshot = {
+        selected_model: pipeline.selectedModel,
+        accuracy: beforeBest.accuracy,
+        f1_score: beforeBest.f1Score,
+        roc_auc: beforeBest.rocAuc,
+        total_records: pipeline.datasetStats.totalRecords,
+      };
+
+      const csvContent = fs.readFileSync(datasetCsvPath, 'utf-8');
+      const parsed = parseAndValidateCsv(csvContent);
+
+      const feedbackRows = db
+        .prepare("SELECT * FROM feedback_samples WHERE status IN ('pending', 'applied')")
+        .all() as unknown as DbFeedbackSample[];
+
+      const pendingCount = feedbackRows.filter((f) => f.status === 'pending').length;
+
+      const feedbackDatasetRows = feedbackRows.map((fb) => ({
+        label: (fb.corrected_label === 'SPAM' ? 1 : 0) as 0 | 1,
+        text: [
+          fb.email_subject ? `Subject: ${fb.email_subject}` : '',
+          fb.email_content,
+          fb.sender_address ? `From: ${fb.sender_address}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      }));
+
+      const mergedRows = [...parsed.rows, ...feedbackDatasetRows];
+      const nextPipeline = trainPipelineFromRows(
+        mergedRows,
+        `${path.basename(datasetCsvPath)} + ${feedbackDatasetRows.length} feedback`
+      );
+      savePipeline(nextPipeline, writableModelPath);
+      pipeline = nextPipeline;
+      syncPipelineMetricsToDb(db, pipeline, null);
+
+      const now = new Date().toISOString();
+      if (pendingCount > 0) {
+        db.prepare("UPDATE feedback_samples SET status = 'applied', applied_at = ? WHERE status = 'pending'").run(now);
+      }
+
+      const afterBest =
+        pipeline.evaluations.find((e) => e.isSelected) || pipeline.evaluations[0];
+      const afterSnapshot = {
+        selected_model: pipeline.selectedModel,
+        accuracy: afterBest.accuracy,
+        f1_score: afterBest.f1Score,
+        roc_auc: afterBest.rocAuc,
+        total_records: pipeline.datasetStats.totalRecords,
+      };
+
+      logActivity(
+        db,
+        req.user!.id,
+        'ACTIVE_LEARNING_RETRAIN',
+        `Merged ${feedbackDatasetRows.length} feedback samples (${pendingCount} newly applied) into ${mergedRows.length} total training rows. Active: ${pipeline.selectedModel} (F1 ${(afterBest.f1Score * 100).toFixed(2)}%)`
+      );
+
+      res.json({
+        message: `Pipeline retrained with ${feedbackDatasetRows.length} active-learning feedback sample(s) (${pendingCount} newly applied).`,
+        applied_count: pendingCount,
+        total_feedback_used: feedbackDatasetRows.length,
+        before: beforeSnapshot,
+        after: afterSnapshot,
+        selected_model: pipeline.selectedModel,
+        dataset_stats: pipeline.datasetStats,
+        evaluations: pipeline.evaluations,
+        ensemble_evaluation: pipeline.ensembleEvaluation,
+      });
+    } catch (err) {
+      res.status(500).json({
+        detail: err instanceof Error ? err.message : 'Active-learning retraining failed.',
+      });
+    }
   });
 
   return {

@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import {
+  analyzeEmailHeaders,
   parseAndValidateCsv,
   predictEmailWithPipeline,
   preprocessText,
+  searchVocabularyWeights,
   trainPipelineFromRows,
 } from '../server/mlEngine.ts';
 import { createApp } from '../server/app.ts';
@@ -83,6 +85,57 @@ test('ML pipeline trains all 3 algorithms and classifies personal, promo spam, a
 
   // 4. Empty email raises error
   assert.throws(() => predictEmailWithPipeline(pipeline, '', '   '));
+
+  // 5. ROC curves, ensemble evaluation, and feature weights populated
+  assert.equal(pipeline.rocCurves.length, 4);
+  assert.equal(pipeline.ensembleEvaluation.modelName, 'Soft-Voting Ensemble');
+  assert.ok(pipeline.featureImportance.topSpam.length >= 10);
+  assert.ok(pipeline.featureImportance.topHam.length >= 10);
+  const searched = searchVocabularyWeights(pipeline, 'bank', 10);
+  assert.ok(searched.totalMatches >= 1);
+
+  // 6. Email Header SPF/DKIM/DMARC Spoof Analyzer
+  const spoofedHeaders = analyzeEmailHeaders(
+    [
+      'From: CFO <cfo@company.com>',
+      'Reply-To: wire@offshore.xyz',
+      'Return-Path: <bounce@unknown.ru>',
+      'Received: from relay1.unknown.ru by mx.local',
+      'Authentication-Results: mx.local; spf=fail; dkim=fail; dmarc=fail',
+    ].join('\n')
+  );
+  assert.equal(spoofedHeaders.hasHeaders, true);
+  assert.equal(spoofedHeaders.spf, 'fail');
+  assert.equal(spoofedHeaders.dkim, 'fail');
+  assert.equal(spoofedHeaders.dmarc, 'fail');
+  assert.equal(spoofedHeaders.replyToMismatch, true);
+  assert.ok(spoofedHeaders.headerRiskScore >= 70);
+
+  const validHeaders = analyzeEmailHeaders(
+    [
+      'From: GitHub <notifications@github.com>',
+      'Reply-To: noreply@github.com',
+      'DKIM-Signature: v=1; a=rsa-sha256; d=github.com;',
+      'Authentication-Results: mx.local; spf=pass; dkim=pass; dmarc=pass',
+    ].join('\n')
+  );
+  assert.equal(validHeaders.spf, 'pass');
+  assert.equal(validHeaders.dkim, 'pass');
+  assert.equal(validHeaders.dmarc, 'pass');
+  assert.equal(validHeaders.replyToMismatch, false);
+  assert.equal(validHeaders.headerRiskScore, 0);
+
+  // 7. Ensemble + custom threshold prediction
+  const ensemblePred = predictEmailWithPipeline(
+    pipeline,
+    'URGENT: Account Verification Needed',
+    'Click http://evil.xyz to confirm your ATM PIN now!',
+    'alert@evil.xyz',
+    { useEnsemble: true, threshold: 0.35 }
+  );
+  assert.equal(ensemblePred.classifierMode, 'Soft-Voting Ensemble');
+  assert.equal(ensemblePred.thresholdUsed, 0.35);
+  assert.equal(ensemblePred.modelBreakdown.length, 4);
 });
 
 test('Full-stack API integration: auth, prediction, batch scan, history ownership, analytics, and admin RBAC', async () => {
@@ -334,6 +387,81 @@ test('Full-stack API integration: auth, prediction, batch scan, history ownershi
     });
     assert.equal(bobMove.status, 200);
     assert.equal(bobMove.body.folder, 'inbox');
+
+    // ROC curves and global feature importance endpoints
+    const rocRes = await req('/api/model/roc');
+    assert.equal(rocRes.status, 200);
+    assert.equal(rocRes.body.roc_curves.length, 4);
+    assert.ok(rocRes.body.ensemble_evaluation.rocAuc >= 0.85);
+
+    const featRes = await req('/api/model/features?q=free');
+    assert.equal(featRes.status, 200);
+    assert.ok(featRes.body.total_matches >= 1);
+
+    // Predict with raw headers, ensemble mode, and custom threshold
+    const headerPred = await req('/api/predict', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        subject: 'Wire transfer request',
+        body: 'Please wire $15,000 urgently and reply to our external settlement desk.',
+        use_ensemble: true,
+        threshold: 0.3,
+        raw_headers:
+          'From: CEO <ceo@corp.com>\nReply-To: pay@evil.xyz\nAuthentication-Results: mx.local; spf=fail; dkim=fail; dmarc=fail',
+      }),
+    });
+    assert.equal(headerPred.status, 201);
+    assert.equal(headerPred.body.classifier_mode, 'Soft-Voting Ensemble');
+    assert.equal(headerPred.body.threshold_used, 0.3);
+    assert.equal(headerPred.body.header_analysis.spf, 'fail');
+    assert.equal(headerPred.body.header_analysis.replyToMismatch, true);
+
+    // Active Learning: Analyst submits correction -> Admin retrains corpus
+    const fbSubmit = await req('/api/feedback', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${tokenA}`,
+      },
+      body: JSON.stringify({
+        email_subject: 'Quarterly Cloud Budget Approved',
+        sender_address: 'finance@company.org',
+        email_content: 'Please proceed with the approved Q4 cloud hosting renewal invoice.',
+        original_prediction: 'SPAM',
+        corrected_label: 'HAM',
+        notes: 'False positive on budget renewal invoice phrasing',
+      }),
+    });
+    assert.equal(fbSubmit.status, 201);
+    const fbId = fbSubmit.body.feedback.id as string;
+
+    const fbForbiddenRetrain = await req('/api/feedback/retrain', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tokenA}` },
+    });
+    assert.equal(fbForbiddenRetrain.status, 403);
+
+    const fbPatch = await req(`/api/feedback/${fbId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ status: 'pending', corrected_label: 'HAM' }),
+    });
+    assert.equal(fbPatch.status, 200);
+
+    const fbRetrain = await req('/api/feedback/retrain', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+    assert.equal(fbRetrain.status, 200);
+    assert.ok(fbRetrain.body.applied_count >= 1);
+    assert.ok(fbRetrain.body.after.total_records > fbRetrain.body.before.total_records);
   } finally {
     db.close();
     server.close();

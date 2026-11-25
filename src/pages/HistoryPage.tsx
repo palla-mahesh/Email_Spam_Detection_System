@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ChevronLeft, ChevronRight, Eye, Search, Trash2, X } from 'lucide-react';
-import { historyApi, PredictionRecord } from '../services/api';
+import { ChevronLeft, ChevronRight, Eye, Flag, Search, Trash2, X } from 'lucide-react';
+import { feedbackApi, historyApi, PredictionRecord } from '../services/api';
 import { VerdictLabel } from '../components/VerdictLabel';
 
 export function HistoryPage() {
@@ -18,6 +18,8 @@ export function HistoryPage() {
   const [selectedRecord, setSelectedRecord] = useState<PredictionRecord | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<PredictionRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [feedbackBanner, setFeedbackBanner] = useState('');
 
   const fetchHistory = useCallback(async () => {
     setLoading(true);
@@ -59,6 +61,29 @@ export function HistoryPage() {
       setError('Unable to delete prediction record.');
     } finally {
       setDeleting(false);
+    }
+  };
+
+  const handleFlagFeedback = async (record: PredictionRecord) => {
+    if (feedbackSubmitting) return;
+    const corrected: 'SPAM' | 'HAM' = record.prediction === 'SPAM' ? 'HAM' : 'SPAM';
+    setFeedbackSubmitting(true);
+    setFeedbackBanner('');
+    try {
+      await feedbackApi.submit({
+        prediction_id: record.id,
+        email_subject: record.email_subject,
+        sender_address: record.sender_address,
+        email_content: record.email_content || record.email_subject,
+        original_prediction: record.prediction,
+        corrected_label: corrected,
+        notes: 'Flagged from Prediction History audit log',
+      });
+      setFeedbackBanner(`Queued for Active Learning: corrected ${record.prediction} -> ${corrected}.`);
+    } catch {
+      setError('Unable to submit Active Learning correction.');
+    } finally {
+      setFeedbackSubmitting(false);
     }
   };
 
@@ -215,7 +240,10 @@ export function HistoryPage() {
                       <div className="inline-flex items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => setSelectedRecord(row)}
+                          onClick={() => {
+                            setFeedbackBanner('');
+                            setSelectedRecord(row);
+                          }}
                           className="p-1.5 rounded-md text-slate-300 hover:text-white hover:bg-slate-800 transition-colors"
                           aria-label={`View details for ${row.email_subject}`}
                         >
@@ -337,6 +365,31 @@ export function HistoryPage() {
                 </div>
               </div>
             )}
+
+            {feedbackBanner && (
+              <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-500/35 text-xs text-emerald-200">
+                {feedbackBanner}
+              </div>
+            )}
+
+            <div className="pt-3 border-t border-slate-800 flex items-center justify-between gap-3">
+              <p className="text-xs text-slate-400">
+                Incorrect label? Send correction to Active Learning retraining queue.
+              </p>
+              <button
+                type="button"
+                disabled={feedbackSubmitting}
+                onClick={() => handleFlagFeedback(selectedRecord)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-amber-200 bg-amber-950/40 hover:bg-amber-950/70 border border-amber-500/30 whitespace-nowrap shrink-0"
+              >
+                <Flag className="w-3.5 h-3.5" />
+                <span>
+                  {feedbackSubmitting
+                    ? 'Submitting...'
+                    : `Mark as ${selectedRecord.prediction === 'SPAM' ? 'HAM' : 'SPAM'}`}
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -80,7 +80,7 @@ export function LandingPage() {
               </h1>
 
               <p className="text-base text-slate-300 leading-relaxed max-w-xl">
-                Classify incoming email messages into SPAM or legitimate HAM using TF-IDF unigram and bigram vectorization, Multinomial Naive Bayes, Logistic Regression, and Platt-calibrated Linear SVM—with built-in phishing intent categorization, brand spoofing inspection, sentence-level risk scoring, and batch scanning requiring zero external API keys.
+                Classify incoming email messages into SPAM or legitimate HAM using TF-IDF n-gram vectorization, Multinomial Naive Bayes, Logistic Regression, Platt-calibrated Linear SVM, and a Soft-Voting Ensemble—complete with live ROC threshold tuning, SPF/DKIM/DMARC header forensics, active-learning retraining, and printable SOC threat reports with zero external API keys.
               </p>
 
               <div className="flex flex-wrap items-center gap-4 pt-2">
@@ -199,14 +199,14 @@ export function LandingPage() {
                     'Extracts unigram and bigram features using sublinear term frequency and smooth inverse document frequency, fitted strictly on the training split to prevent data leakage.',
                 },
                 {
-                  step: '03. Algorithm Comparison',
+                  step: '03. Ensemble & ROC Tuning',
                   detail:
-                    'Trains Multinomial Naive Bayes, L2-regularized Logistic Regression, and Linear SVM with 3-fold Platt scaling calibration, selecting the top F1/ROC-AUC classifier.',
+                    'Evaluates Multinomial Naive Bayes, Logistic Regression, Platt-calibrated Linear SVM, and a weighted Soft-Voting Ensemble across 21 ROC thresholds.',
                 },
                 {
-                  step: '04. Explainable Audit',
+                  step: '04. Forensics & Active Learning',
                   detail:
-                    'Returns real-time latency, calibrated spam probability, suspicious token attribution weights, and saves every classification permanently to the database.',
+                    'Audits SPF/DKIM/DMARC headers, token weights, and printable SOC threat briefs while queuing human-in-the-loop corrections for live corpus retraining.',
                 },
               ].map((item) => (
                 <div

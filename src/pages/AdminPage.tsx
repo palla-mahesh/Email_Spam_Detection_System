@@ -1,6 +1,14 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Upload } from 'lucide-react';
-import { adminApi, mlApi, ModelMetricRow, UserProfile } from '../services/api';
+import { CheckCircle2, RefreshCw, RotateCcw, Sparkles, Upload, XCircle } from 'lucide-react';
+import {
+  adminApi,
+  feedbackApi,
+  FeedbackSample,
+  mlApi,
+  ModelMetricRow,
+  RetrainFeedbackResponse,
+  UserProfile,
+} from '../services/api';
 
 interface AdminDashboardData {
   total_users: number;
@@ -41,6 +49,12 @@ export function AdminPage() {
   const [error, setError] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
 
+  // Active Learning feedback state
+  const [feedbackItems, setFeedbackItems] = useState<FeedbackSample[]>([]);
+  const [feedbackCounts, setFeedbackCounts] = useState({ pending: 0, applied: 0, dismissed: 0 });
+  const [retrainingFeedback, setRetrainingFeedback] = useState(false);
+  const [retrainReport, setRetrainReport] = useState<RetrainFeedbackResponse | null>(null);
+
   // CSV upload state
   const [datasetName, setDatasetName] = useState('custom_spam_corpus.csv');
   const [csvContent, setCsvContent] = useState('');
@@ -52,16 +66,19 @@ export function AdminPage() {
     setLoading(true);
     setError('');
     try {
-      const [dashRes, usersRes, dsRes, actRes] = await Promise.all([
+      const [dashRes, usersRes, dsRes, actRes, fbRes] = await Promise.all([
         adminApi.dashboard(),
         adminApi.users(),
         adminApi.datasets(),
         adminApi.activity(),
+        feedbackApi.list('ALL'),
       ]);
       setDashboard(dashRes.data);
       setUsers(usersRes.data.users);
       setDatasets(dsRes.data.datasets);
       setActivities(actRes.data.activities);
+      setFeedbackItems(fbRes.data.items);
+      setFeedbackCounts(fbRes.data.counts);
     } catch {
       setError('Unable to load administrator telemetry.');
     } finally {
@@ -144,6 +161,38 @@ export function AdminPage() {
     }
   };
 
+  const handleUpdateFeedbackStatus = async (
+    item: FeedbackSample,
+    nextStatus: 'pending' | 'dismissed'
+  ) => {
+    setError('');
+    try {
+      await feedbackApi.update(item.id, { status: nextStatus });
+      await loadAdminData();
+    } catch {
+      setError('Failed to update feedback sample status.');
+    }
+  };
+
+  const handleRetrainWithFeedback = async () => {
+    setError('');
+    setStatusMessage('');
+    setRetrainingFeedback(true);
+    try {
+      const { data } = await feedbackApi.retrain();
+      setRetrainReport(data);
+      setStatusMessage(data.message);
+      await loadAdminData();
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Active Learning retraining failed.';
+      setError(msg);
+    } finally {
+      setRetrainingFeedback(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="space-y-6">
@@ -209,6 +258,152 @@ export function AdminPage() {
             <RefreshCw className={`w-3.5 h-3.5 ${retraining ? 'animate-spin' : ''}`} />
             <span>{retraining ? 'Retraining...' : 'Retrain Corpus'}</span>
           </button>
+        </div>
+      </div>
+
+      {/* Active Learning Feedback Queue & Incremental Retraining Lab */}
+      <div className="rounded-xl bg-slate-900/75 border border-slate-800 overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <h2 className="font-display text-base font-semibold text-white">
+              Active Learning Feedback Queue &amp; Live Model Retraining
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5 font-mono tabular-nums">
+              {feedbackCounts.pending} Pending · {feedbackCounts.applied} Applied ·{' '}
+              {feedbackCounts.dismissed} Dismissed
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={retrainingFeedback}
+            onClick={handleRetrainWithFeedback}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 transition-colors whitespace-nowrap"
+          >
+            {retrainingFeedback ? (
+              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="w-3.5 h-3.5" />
+            )}
+            <span>
+              {retrainingFeedback ? 'Retraining with Feedback...' : 'Retrain Pipeline with Feedback'}
+            </span>
+          </button>
+        </div>
+
+        {retrainReport && (
+          <div className="px-6 py-4 bg-indigo-950/25 border-b border-slate-800 grid grid-cols-1 sm:grid-cols-4 gap-4 text-xs">
+            <div>
+              <p className="text-slate-400">Training Corpus</p>
+              <p className="mt-1 font-mono font-semibold text-white tabular-nums">
+                {retrainReport.before.total_records} &rarr; {retrainReport.after.total_records} rows
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-400">Validation Accuracy</p>
+              <p className="mt-1 font-mono font-semibold text-white tabular-nums">
+                {(retrainReport.before.accuracy * 100).toFixed(2)}% &rarr;{' '}
+                {(retrainReport.after.accuracy * 100).toFixed(2)}%
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-400">Validation F1-Score</p>
+              <p className="mt-1 font-mono font-semibold text-indigo-300 tabular-nums">
+                {(retrainReport.before.f1_score * 100).toFixed(2)}% &rarr;{' '}
+                {(retrainReport.after.f1_score * 100).toFixed(2)}%
+              </p>
+            </div>
+            <div>
+              <p className="text-slate-400">Active Model</p>
+              <p className="mt-1 font-semibold text-emerald-300">{retrainReport.after.selected_model}</p>
+            </div>
+          </div>
+        )}
+
+        <div className="overflow-x-auto">
+          {feedbackItems.length === 0 ? (
+            <p className="px-6 py-8 text-xs text-slate-500 text-center">
+              No feedback corrections queued yet. Flag misclassified emails from Detection or History to refine the corpus.
+            </p>
+          ) : (
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="border-b border-slate-800 text-slate-400">
+                  <th className="py-3 px-6">Email Sample &amp; Notes</th>
+                  <th className="py-3 px-4">Label Correction</th>
+                  <th className="py-3 px-4">Status</th>
+                  <th className="py-3 px-4">Submitted By</th>
+                  <th className="py-3 px-6 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/70">
+                {feedbackItems.map((item) => (
+                  <tr key={item.id} className="hover:bg-slate-800/35">
+                    <td className="py-3 px-6 max-w-md">
+                      <p className="font-medium text-slate-100 truncate">{item.email_subject}</p>
+                      {item.sender_address && (
+                        <p className="text-slate-500 truncate">{item.sender_address}</p>
+                      )}
+                      {item.notes && <p className="text-slate-400 mt-0.5 truncate">{item.notes}</p>}
+                    </td>
+                    <td className="py-3 px-4 font-mono whitespace-nowrap">
+                      <span className="text-slate-400">{item.original_prediction}</span>
+                      <span className="mx-1.5 text-slate-600">&rarr;</span>
+                      <span
+                        className={
+                          item.corrected_label === 'SPAM'
+                            ? 'text-rose-400 font-semibold'
+                            : 'text-emerald-400 font-semibold'
+                        }
+                      >
+                        {item.corrected_label}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 whitespace-nowrap font-mono">
+                      {item.status === 'applied' ? (
+                        <span className="inline-flex items-center gap-1 text-emerald-400">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Applied</span>
+                        </span>
+                      ) : item.status === 'pending' ? (
+                        <span className="inline-flex items-center gap-1 text-amber-300">
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          <span>Pending</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-slate-500">
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>Dismissed</span>
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-3 px-4 text-slate-400 whitespace-nowrap">
+                      {item.submitted_by_email || 'Analyst'}
+                    </td>
+                    <td className="py-3 px-6 text-right whitespace-nowrap">
+                      {item.status !== 'dismissed' ? (
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateFeedbackStatus(item, 'dismissed')}
+                          className="px-2.5 py-1 rounded bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 transition-colors"
+                        >
+                          Dismiss
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateFeedbackStatus(item, 'pending')}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 transition-colors"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Re-Queue</span>
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 

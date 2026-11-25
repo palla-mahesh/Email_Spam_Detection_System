@@ -90,11 +90,80 @@ export interface BatchPredictionItem {
   error?: string;
 }
 
+export interface RocPoint {
+  threshold: number;
+  fpr: number;
+  tpr: number;
+  tp: number;
+  fp: number;
+  tn: number;
+  fn: number;
+  precision: number;
+  recall: number;
+  f1: number;
+  accuracy: number;
+}
+
+export interface ModelRocCurve {
+  modelName: string;
+  rocAuc: number;
+  points: RocPoint[];
+}
+
+export interface FeatureWeightItem {
+  term: string;
+  spamWeight: number;
+  lrWeight: number;
+  svmWeight: number;
+  nbLogOdds: number;
+  polarity: 'spam' | 'ham';
+}
+
+export interface EnsembleEvaluation {
+  modelName: 'Soft-Voting Ensemble';
+  weights: {
+    naiveBayes: number;
+    logisticRegression: number;
+    linearSvm: number;
+  };
+  accuracy: number;
+  precisionScore: number;
+  recallScore: number;
+  f1Score: number;
+  rocAuc: number;
+  confusionMatrix: [[number, number], [number, number]];
+  calibrationNote: string;
+}
+
+export type HeaderAuthStatus = 'pass' | 'fail' | 'softfail' | 'neutral' | 'missing';
+
+export interface HeaderAnalysis {
+  hasHeaders: boolean;
+  spf: HeaderAuthStatus;
+  dkim: HeaderAuthStatus;
+  dmarc: HeaderAuthStatus;
+  fromAddress: string | null;
+  replyToAddress: string | null;
+  returnPathAddress: string | null;
+  replyToMismatch: boolean;
+  returnPathMismatch: boolean;
+  hopCount: number;
+  headerRiskScore: number;
+  findings: Array<{
+    check: string;
+    status: HeaderAuthStatus | 'warn';
+    detail: string;
+  }>;
+}
+
 export interface PredictionOutput {
   prediction: 'SPAM' | 'HAM';
   spamProbability: number;
+  ensembleProbability: number;
   confidenceScore: number;
   modelName: string;
+  classifierMode: 'Active Best Model' | 'Soft-Voting Ensemble';
+  thresholdUsed: number;
   processingTimeMs: number;
   suspiciousKeywords: SuspiciousKeyword[];
   preprocessedTokens: string[];
@@ -105,6 +174,7 @@ export interface PredictionOutput {
   }>;
   threatCategory: ThreatCategory;
   riskIndicators: RiskIndicators;
+  headerAnalysis: HeaderAnalysis;
   sentenceAnalysis: SentenceRisk[];
   aiAdvisory: string;
   suggestedReplies: string[];
@@ -137,6 +207,12 @@ export interface TrainedPipeline {
   idf: number[];
   selectedModel: 'Multinomial Naive Bayes' | 'Logistic Regression' | 'Linear SVM';
   evaluations: ModelEvaluation[];
+  ensembleEvaluation: EnsembleEvaluation;
+  rocCurves: ModelRocCurve[];
+  featureImportance: {
+    topSpam: FeatureWeightItem[];
+    topHam: FeatureWeightItem[];
+  };
   naiveBayes: SerializedNaiveBayes;
   logisticRegression: SerializedLinearModel;
   linearSvm: SerializedLinearModel;
@@ -757,6 +833,105 @@ function computeMetrics(
   };
 }
 
+function computeRocCurvePoints(yTrue: Array<0 | 1>, probs: number[]): RocPoint[] {
+  const points: RocPoint[] = [];
+  for (let step = 0; step <= 20; step++) {
+    const threshold = Number((step * 0.05).toFixed(2));
+    let tp = 0;
+    let tn = 0;
+    let fp = 0;
+    let fn = 0;
+
+    for (let i = 0; i < yTrue.length; i++) {
+      const pred = probs[i] >= threshold ? 1 : 0;
+      if (yTrue[i] === 1 && pred === 1) tp++;
+      else if (yTrue[i] === 0 && pred === 0) tn++;
+      else if (yTrue[i] === 0 && pred === 1) fp++;
+      else fn++;
+    }
+
+    const totalPos = tp + fn || 1;
+    const totalNeg = tn + fp || 1;
+    const total = yTrue.length || 1;
+    const tpr = tp / totalPos;
+    const fpr = fp / totalNeg;
+    const precision = tp + fp > 0 ? tp / (tp + fp) : 1;
+    const recall = tpr;
+    const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
+    const accuracy = (tp + tn) / total;
+
+    points.push({
+      threshold,
+      fpr: Number(fpr.toFixed(4)),
+      tpr: Number(tpr.toFixed(4)),
+      tp,
+      fp,
+      tn,
+      fn,
+      precision: Number(precision.toFixed(4)),
+      recall: Number(recall.toFixed(4)),
+      f1: Number(f1.toFixed(4)),
+      accuracy: Number(accuracy.toFixed(4)),
+    });
+  }
+  return points;
+}
+
+function extractFeatureWeights(
+  vocabulary: Record<string, number>,
+  naiveBayes: SerializedNaiveBayes,
+  logisticRegression: SerializedLinearModel,
+  linearSvm: SerializedLinearModel
+): FeatureWeightItem[] {
+  const items: FeatureWeightItem[] = [];
+  for (const [term, idx] of Object.entries(vocabulary)) {
+    const nbLogOdds =
+      naiveBayes.logLikelihoodSpam[idx] - naiveBayes.logLikelihoodHam[idx];
+    const lrWeight = logisticRegression.weights[idx] ?? 0;
+    const svmWeight = linearSvm.weights[idx] ?? 0;
+    const spamWeight = lrWeight * 0.45 + svmWeight * 0.35 + nbLogOdds * 0.2;
+    items.push({
+      term,
+      spamWeight: Number(spamWeight.toFixed(4)),
+      lrWeight: Number(lrWeight.toFixed(4)),
+      svmWeight: Number(svmWeight.toFixed(4)),
+      nbLogOdds: Number(nbLogOdds.toFixed(4)),
+      polarity: spamWeight >= 0 ? 'spam' : 'ham',
+    });
+  }
+  return items;
+}
+
+export function searchVocabularyWeights(
+  pipeline: TrainedPipeline,
+  query = '',
+  limit = 15
+): { topSpam: FeatureWeightItem[]; topHam: FeatureWeightItem[]; totalMatches: number } {
+  const cleanQuery = query.trim().toLowerCase();
+  const all = extractFeatureWeights(
+    pipeline.vocabulary,
+    pipeline.naiveBayes,
+    pipeline.logisticRegression,
+    pipeline.linearSvm
+  ).filter((item) => !cleanQuery || item.term.toLowerCase().includes(cleanQuery));
+
+  const topSpam = all
+    .filter((i) => i.spamWeight > 0)
+    .sort((a, b) => b.spamWeight - a.spamWeight)
+    .slice(0, limit);
+
+  const topHam = all
+    .filter((i) => i.spamWeight < 0)
+    .sort((a, b) => a.spamWeight - b.spamWeight)
+    .slice(0, limit);
+
+  return {
+    topSpam,
+    topHam,
+    totalMatches: all.length,
+  };
+}
+
 function crossValidateAccuracy(
   trainRows: DatasetRow[],
   algo: 'nb' | 'lr' | 'svm',
@@ -832,10 +1007,14 @@ export function trainPipelineFromRows(
   const nbProbs = XTest.map((v) => predictNaiveBayes(v, naiveBayes));
   const lrProbs = XTest.map((v) => predictLogisticRegression(v, logisticRegression));
   const svmProbs = XTest.map((v) => predictLinearSvm(v, linearSvm));
+  const ensembleProbs = yTest.map(
+    (_y, idx) => 0.25 * nbProbs[idx] + 0.35 * lrProbs[idx] + 0.4 * svmProbs[idx]
+  );
 
   const nbMetrics = computeMetrics(yTest, nbProbs);
   const lrMetrics = computeMetrics(yTest, lrProbs);
   const svmMetrics = computeMetrics(yTest, svmProbs);
+  const ensembleMetrics = computeMetrics(yTest, ensembleProbs);
 
   const nbCv = crossValidateAccuracy(train, 'nb', 5);
   const lrCv = crossValidateAccuracy(train, 'lr', 5);
@@ -878,11 +1057,62 @@ export function trainPipelineFromRows(
   }
   candidates[bestIdx].isSelected = true;
 
+  const ensembleEvaluation: EnsembleEvaluation = {
+    modelName: 'Soft-Voting Ensemble',
+    weights: {
+      naiveBayes: 0.25,
+      logisticRegression: 0.35,
+      linearSvm: 0.4,
+    },
+    ...ensembleMetrics,
+    calibrationNote: 'Weighted Consensus (0.25 NB + 0.35 LR + 0.40 Calibrated SVM)',
+  };
+
+  const rocCurves: ModelRocCurve[] = [
+    {
+      modelName: 'Multinomial Naive Bayes',
+      rocAuc: nbMetrics.rocAuc,
+      points: computeRocCurvePoints(yTest, nbProbs),
+    },
+    {
+      modelName: 'Logistic Regression',
+      rocAuc: lrMetrics.rocAuc,
+      points: computeRocCurvePoints(yTest, lrProbs),
+    },
+    {
+      modelName: 'Linear SVM',
+      rocAuc: svmMetrics.rocAuc,
+      points: computeRocCurvePoints(yTest, svmProbs),
+    },
+    {
+      modelName: 'Soft-Voting Ensemble',
+      rocAuc: ensembleMetrics.rocAuc,
+      points: computeRocCurvePoints(yTest, ensembleProbs),
+    },
+  ];
+
+  const allFeatureWeights = extractFeatureWeights(
+    vocabulary,
+    naiveBayes,
+    logisticRegression,
+    linearSvm
+  );
+  const featureImportance = {
+    topSpam: allFeatureWeights
+      .filter((i) => i.spamWeight > 0)
+      .sort((a, b) => b.spamWeight - a.spamWeight)
+      .slice(0, 15),
+    topHam: allFeatureWeights
+      .filter((i) => i.spamWeight < 0)
+      .sort((a, b) => a.spamWeight - b.spamWeight)
+      .slice(0, 15),
+  };
+
   const spamCount = rows.filter((r) => r.label === 1).length;
   const hamCount = rows.length - spamCount;
 
   return {
-    version: '1.0.0',
+    version: '2.0.0',
     trainedAt: new Date().toISOString(),
     datasetStats: {
       datasetName,
@@ -897,6 +1127,9 @@ export function trainPipelineFromRows(
     idf,
     selectedModel: candidates[bestIdx].modelName,
     evaluations: candidates,
+    ensembleEvaluation,
+    rocCurves,
+    featureImportance,
     naiveBayes,
     logisticRegression,
     linearSvm,
@@ -916,8 +1149,22 @@ export function loadOrTrainPipeline(
   datasetCsvPath: string
 ): TrainedPipeline {
   if (fs.existsSync(modelPath)) {
-    const raw = fs.readFileSync(modelPath, 'utf-8');
-    return JSON.parse(raw) as TrainedPipeline;
+    try {
+      const raw = fs.readFileSync(modelPath, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<TrainedPipeline>;
+      if (
+        parsed.rocCurves &&
+        parsed.ensembleEvaluation &&
+        parsed.featureImportance &&
+        parsed.naiveBayes &&
+        parsed.logisticRegression &&
+        parsed.linearSvm
+      ) {
+        return parsed as TrainedPipeline;
+      }
+    } catch {
+      // Fall through to retrain if cached artifact is stale or unreadable
+    }
   }
 
   const csvContent = fs.readFileSync(datasetCsvPath, 'utf-8');
@@ -1187,6 +1434,191 @@ export function generateAiAdvisoryAndReplies(
   };
 }
 
+function extractEmailAddress(raw: string | null): string | null {
+  if (!raw) return null;
+  const angleMatch = raw.match(/<([^>\s]+@[^>\s]+)>/);
+  if (angleMatch) return angleMatch[1].toLowerCase().trim();
+  const plainMatch = raw.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  return plainMatch ? plainMatch[0].toLowerCase().trim() : null;
+}
+
+function getDomainFromEmail(email: string | null): string {
+  if (!email) return '';
+  const idx = email.lastIndexOf('@');
+  return idx !== -1 ? email.slice(idx + 1).toLowerCase() : '';
+}
+
+function parseHeaderStatus(rawToken: string | undefined): HeaderAuthStatus {
+  const t = (rawToken || '').toLowerCase();
+  if (t.includes('fail') && !t.includes('softfail')) return 'fail';
+  if (t.includes('softfail')) return 'softfail';
+  if (t.includes('pass')) return 'pass';
+  if (t.includes('neutral') || t.includes('none') || t.includes('temperror')) return 'neutral';
+  return 'missing';
+}
+
+export function analyzeEmailHeaders(rawHeaders?: string, sender?: string): HeaderAnalysis {
+  const cleanRaw = (rawHeaders ?? '').trim();
+  const fallbackFrom = extractEmailAddress(sender || null);
+
+  if (!cleanRaw) {
+    return {
+      hasHeaders: false,
+      spf: 'missing',
+      dkim: 'missing',
+      dmarc: 'missing',
+      fromAddress: fallbackFrom,
+      replyToAddress: null,
+      returnPathAddress: null,
+      replyToMismatch: false,
+      returnPathMismatch: false,
+      hopCount: 0,
+      headerRiskScore: 0,
+      findings: [],
+    };
+  }
+
+  // Unfold RFC 5322 multiline headers
+  const unfolded = cleanRaw.replace(/\r\n/g, '\n').replace(/\n[ \t]+/g, ' ');
+  const lines = unfolded.split('\n');
+  const headerMap = new Map<string, string[]>();
+
+  for (const line of lines) {
+    const colonIdx = line.indexOf(':');
+    if (colonIdx <= 0) continue;
+    const key = line.slice(0, colonIdx).trim().toLowerCase();
+    const val = line.slice(colonIdx + 1).trim();
+    const existing = headerMap.get(key) || [];
+    existing.push(val);
+    headerMap.set(key, existing);
+  }
+
+  const fromAddress = extractEmailAddress(headerMap.get('from')?.[0] || null) || fallbackFrom;
+  const replyToAddress = extractEmailAddress(headerMap.get('reply-to')?.[0] || null);
+  const returnPathAddress = extractEmailAddress(headerMap.get('return-path')?.[0] || null);
+
+  const authResults = (headerMap.get('authentication-results') || []).join(' ; ');
+  const receivedSpf = (headerMap.get('received-spf') || []).join(' ');
+  const hasDkimSig = (headerMap.get('dkim-signature') || []).length > 0;
+
+  const spfMatch = authResults.match(/\bspf\s*=\s*([a-z]+)/i);
+  const dkimMatch = authResults.match(/\bdkim\s*=\s*([a-z]+)/i);
+  const dmarcMatch = authResults.match(/\bdmarc\s*=\s*([a-z]+)/i);
+
+  let spf: HeaderAuthStatus = spfMatch ? parseHeaderStatus(spfMatch[1]) : 'missing';
+  if (spf === 'missing' && receivedSpf) {
+    spf = parseHeaderStatus(receivedSpf.split(/\s+/)[0]);
+  }
+
+  let dkim: HeaderAuthStatus = dkimMatch ? parseHeaderStatus(dkimMatch[1]) : 'missing';
+  if (dkim === 'missing' && hasDkimSig) {
+    dkim = 'neutral';
+  }
+
+  const dmarc: HeaderAuthStatus = dmarcMatch ? parseHeaderStatus(dmarcMatch[1]) : 'missing';
+
+  const fromDomain = getDomainFromEmail(fromAddress);
+  const replyToDomain = getDomainFromEmail(replyToAddress);
+  const returnPathDomain = getDomainFromEmail(returnPathAddress);
+
+  const replyToMismatch = Boolean(
+    fromDomain && replyToDomain && fromDomain !== replyToDomain && !replyToDomain.endsWith(`.${fromDomain}`)
+  );
+  const returnPathMismatch = Boolean(
+    fromDomain &&
+      returnPathDomain &&
+      fromDomain !== returnPathDomain &&
+      !returnPathDomain.endsWith(`.${fromDomain}`) &&
+      !fromDomain.endsWith(`.${returnPathDomain}`)
+  );
+
+  const hopCount = (headerMap.get('received') || []).length;
+
+  let risk = 0;
+  const findings: HeaderAnalysis['findings'] = [];
+
+  if (spf === 'fail') {
+    risk += 28;
+    findings.push({ check: 'SPF Validation', status: 'fail', detail: 'Sender IP failed SPF authorization check.' });
+  } else if (spf === 'softfail') {
+    risk += 16;
+    findings.push({ check: 'SPF Validation', status: 'softfail', detail: 'SPF returned softfail (~all); sender server is unverified.' });
+  } else if (spf === 'pass') {
+    findings.push({ check: 'SPF Validation', status: 'pass', detail: 'Originating mail server authorized by sender SPF policy.' });
+  } else {
+    risk += 8;
+    findings.push({ check: 'SPF Validation', status: spf, detail: 'No verified SPF pass record present in headers.' });
+  }
+
+  if (dkim === 'fail') {
+    risk += 25;
+    findings.push({ check: 'DKIM Signature', status: 'fail', detail: 'Cryptographic DKIM body/header signature verification failed.' });
+  } else if (dkim === 'pass') {
+    findings.push({ check: 'DKIM Signature', status: 'pass', detail: 'Cryptographic DKIM signature verified intact.' });
+  } else {
+    risk += 8;
+    findings.push({ check: 'DKIM Signature', status: dkim, detail: 'DKIM signature missing or unverified by receiving MTA.' });
+  }
+
+  if (dmarc === 'fail') {
+    risk += 30;
+    findings.push({ check: 'DMARC Alignment', status: 'fail', detail: 'DMARC policy alignment failed; high spoofing risk.' });
+  } else if (dmarc === 'pass') {
+    findings.push({ check: 'DMARC Alignment', status: 'pass', detail: 'Header From domain aligned with SPF/DKIM under DMARC.' });
+  } else {
+    risk += 10;
+    findings.push({ check: 'DMARC Alignment', status: dmarc, detail: 'DMARC verification missing or non-enforcing.' });
+  }
+
+  if (replyToMismatch) {
+    risk += 22;
+    findings.push({
+      check: 'Reply-To Alignment',
+      status: 'warn',
+      detail: `Reply-To (${replyToAddress}) diverts responses away from From (${fromAddress}).`,
+    });
+  }
+
+  if (returnPathMismatch) {
+    risk += 14;
+    findings.push({
+      check: 'Return-Path Alignment',
+      status: 'warn',
+      detail: `Bounce Return-Path (${returnPathAddress}) mismatches From domain (${fromDomain}).`,
+    });
+  }
+
+  if (hopCount > 6) {
+    risk += 10;
+    findings.push({
+      check: 'SMTP Relay Hops',
+      status: 'warn',
+      detail: `Elevated relay chain (${hopCount} Received hops) observed.`,
+    });
+  } else if (hopCount > 0) {
+    findings.push({
+      check: 'SMTP Relay Hops',
+      status: 'pass',
+      detail: `Normal delivery relay path (${hopCount} hop${hopCount === 1 ? '' : 's'}).`,
+    });
+  }
+
+  return {
+    hasHeaders: true,
+    spf,
+    dkim,
+    dmarc,
+    fromAddress,
+    replyToAddress,
+    returnPathAddress,
+    replyToMismatch,
+    returnPathMismatch,
+    hopCount,
+    headerRiskScore: Math.min(100, risk),
+    findings,
+  };
+}
+
 /**
  * Step 7: Real-Time Prediction + Suspicious Keyword Attribution + AI Threat Intelligence
  */
@@ -1194,13 +1626,19 @@ export function predictEmailWithPipeline(
   pipeline: TrainedPipeline,
   subject: string,
   body: string,
-  sender?: string
+  sender?: string,
+  options?: {
+    rawHeaders?: string;
+    useEnsemble?: boolean;
+    threshold?: number;
+  }
 ): PredictionOutput {
   const start = performance.now();
 
   const cleanSubject = (subject ?? '').trim();
   const cleanBody = (body ?? '').trim();
-  const cleanSender = (sender ?? '').trim();
+  const headerAnalysis = analyzeEmailHeaders(options?.rawHeaders, sender);
+  const cleanSender = (sender ?? '').trim() || headerAnalysis.fromAddress || '';
 
   if (!cleanSubject && !cleanBody) {
     throw new Error('Email subject or body must contain meaningful text.');
@@ -1224,13 +1662,22 @@ export function predictEmailWithPipeline(
   const nbProb = predictNaiveBayes(vec, pipeline.naiveBayes);
   const lrProb = predictLogisticRegression(vec, pipeline.logisticRegression);
   const svmProb = predictLinearSvm(vec, pipeline.linearSvm);
+  const ensembleProb = 0.25 * nbProb + 0.35 * lrProb + 0.4 * svmProb;
 
-  let primaryProb = lrProb;
-  if (pipeline.selectedModel === 'Multinomial Naive Bayes') primaryProb = nbProb;
-  else if (pipeline.selectedModel === 'Linear SVM') primaryProb = svmProb;
+  let activeProb = lrProb;
+  if (pipeline.selectedModel === 'Multinomial Naive Bayes') activeProb = nbProb;
+  else if (pipeline.selectedModel === 'Linear SVM') activeProb = svmProb;
 
-  const clampedProb = Math.min(0.9999, Math.max(0.0001, primaryProb));
-  const prediction: 'SPAM' | 'HAM' = clampedProb >= 0.5 ? 'SPAM' : 'HAM';
+  const useEnsemble = Boolean(options?.useEnsemble);
+  const selectedRawProb = useEnsemble ? ensembleProb : activeProb;
+  const thresholdUsed =
+    typeof options?.threshold === 'number' && !Number.isNaN(options.threshold)
+      ? Number(Math.min(0.95, Math.max(0.05, options.threshold)).toFixed(2))
+      : 0.5;
+
+  const clampedProb = Math.min(0.9999, Math.max(0.0001, selectedRawProb));
+  const clampedEnsemble = Math.min(0.9999, Math.max(0.0001, ensembleProb));
+  const prediction: 'SPAM' | 'HAM' = clampedProb >= thresholdUsed ? 'SPAM' : 'HAM';
   const confidenceScore = prediction === 'SPAM' ? clampedProb : 1 - clampedProb;
 
   // Invert vocabulary index -> term for explainable feature attribution
@@ -1246,7 +1693,6 @@ export function predictEmailWithPipeline(
     const term = indexToTerm.get(idx);
     if (!term) continue;
 
-    // Combine log-odds from Naive Bayes and Linear model weight for crisp token attribution
     const nbLogOdds =
       pipeline.naiveBayes.logLikelihoodSpam[idx] - pipeline.naiveBayes.logLikelihoodHam[idx];
     const lrWeight = pipeline.logisticRegression.weights[idx];
@@ -1264,9 +1710,28 @@ export function predictEmailWithPipeline(
   suspiciousKeywords.sort((a, b) => b.weight - a.weight);
 
   const riskIndicators = analyzeManipulationSignals(cleanSubject, cleanBody, cleanSender);
+  if (headerAnalysis.hasHeaders && headerAnalysis.headerRiskScore > 0) {
+    riskIndicators.urgencyScore = Math.min(
+      100,
+      Math.round(riskIndicators.urgencyScore + headerAnalysis.headerRiskScore * 0.35)
+    );
+    if (
+      (headerAnalysis.spf === 'fail' || headerAnalysis.dmarc === 'fail' || headerAnalysis.dkim === 'fail') &&
+      !riskIndicators.manipulationTriggers.includes('Header authentication failure (SPF/DKIM/DMARC)')
+    ) {
+      riskIndicators.manipulationTriggers.unshift('Header authentication failure (SPF/DKIM/DMARC)');
+    }
+    if (
+      headerAnalysis.replyToMismatch &&
+      !riskIndicators.manipulationTriggers.includes('Reply-To domain divergence')
+    ) {
+      riskIndicators.manipulationTriggers.unshift('Reply-To domain divergence');
+    }
+  }
+
   const threatCategory = classifyThreatCategory(cleanSubject, cleanBody, prediction, riskIndicators);
   const sentenceAnalysis = analyzeSentences(pipeline, cleanBody || cleanSubject);
-  const { aiAdvisory, suggestedReplies } = generateAiAdvisoryAndReplies(
+  const { aiAdvisory: baseAdvisory, suggestedReplies } = generateAiAdvisoryAndReplies(
     prediction,
     threatCategory,
     riskIndicators,
@@ -1274,35 +1739,52 @@ export function predictEmailWithPipeline(
     cleanBody
   );
 
+  const headerAdvisoryPrefix =
+    headerAnalysis.hasHeaders && headerAnalysis.headerRiskScore >= 40
+      ? `Header forensics flagged authentication anomalies (SPF: ${headerAnalysis.spf.toUpperCase()}, DKIM: ${headerAnalysis.dkim.toUpperCase()}, DMARC: ${headerAnalysis.dmarc.toUpperCase()}${headerAnalysis.replyToMismatch ? ', Reply-To mismatch' : ''}). `
+      : '';
+  const aiAdvisory = `${headerAdvisoryPrefix}${baseAdvisory}`;
+
   const processingTimeMs = Number((performance.now() - start).toFixed(2));
+  const classifierMode = useEnsemble ? 'Soft-Voting Ensemble' : 'Active Best Model';
+  const modelName = useEnsemble ? 'Soft-Voting Ensemble' : pipeline.selectedModel;
 
   return {
     prediction,
     spamProbability: Number(clampedProb.toFixed(4)),
+    ensembleProbability: Number(clampedEnsemble.toFixed(4)),
     confidenceScore: Number(confidenceScore.toFixed(4)),
-    modelName: pipeline.selectedModel,
+    modelName,
+    classifierMode,
+    thresholdUsed,
     processingTimeMs,
     suspiciousKeywords: suspiciousKeywords.slice(0, 8),
     preprocessedTokens: Array.from(new Set(ngrams)).slice(0, 24),
     modelBreakdown: [
       {
         modelName: 'Multinomial Naive Bayes',
-        prediction: nbProb >= 0.5 ? 'SPAM' : 'HAM',
+        prediction: nbProb >= thresholdUsed ? 'SPAM' : 'HAM',
         spamProbability: Number(nbProb.toFixed(4)),
       },
       {
         modelName: 'Logistic Regression',
-        prediction: lrProb >= 0.5 ? 'SPAM' : 'HAM',
+        prediction: lrProb >= thresholdUsed ? 'SPAM' : 'HAM',
         spamProbability: Number(lrProb.toFixed(4)),
       },
       {
         modelName: 'Linear SVM',
-        prediction: svmProb >= 0.5 ? 'SPAM' : 'HAM',
+        prediction: svmProb >= thresholdUsed ? 'SPAM' : 'HAM',
         spamProbability: Number(svmProb.toFixed(4)),
+      },
+      {
+        modelName: 'Soft-Voting Ensemble',
+        prediction: clampedEnsemble >= thresholdUsed ? 'SPAM' : 'HAM',
+        spamProbability: Number(clampedEnsemble.toFixed(4)),
       },
     ],
     threatCategory,
     riskIndicators,
+    headerAnalysis,
     sentenceAnalysis,
     aiAdvisory,
     suggestedReplies,

@@ -248,3 +248,43 @@ CREATE POLICY "Participants delete own mail"
         OR recipient_id IN (SELECT id FROM public.users WHERE auth_user_id = auth.uid())
         OR recipient_email = (SELECT email FROM public.users WHERE auth_user_id = auth.uid())
     );
+
+-- -----------------------------------------------------------------------------
+-- 7. feedback_samples table (Active Learning Feedback & Model Retraining Queue)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.feedback_samples (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    prediction_id UUID REFERENCES public.email_predictions(id) ON DELETE SET NULL,
+    submitted_by UUID REFERENCES public.users(id) ON DELETE SET NULL,
+    email_subject TEXT NOT NULL DEFAULT '(No Subject)',
+    sender_address TEXT,
+    email_content TEXT NOT NULL CHECK (char_length(trim(email_content)) >= 1),
+    original_prediction TEXT NOT NULL CHECK (original_prediction IN ('SPAM', 'HAM')),
+    corrected_label TEXT NOT NULL CHECK (corrected_label IN ('SPAM', 'HAM')),
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'dismissed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    applied_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_status_created
+    ON public.feedback_samples(status, created_at DESC);
+
+ALTER TABLE public.feedback_samples ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users read own feedback and admins read all"
+    ON public.feedback_samples FOR SELECT
+    USING (
+        submitted_by IN (SELECT id FROM public.users WHERE auth_user_id = auth.uid())
+        OR public.is_admin()
+    );
+
+CREATE POLICY "Authenticated users submit feedback"
+    ON public.feedback_samples FOR INSERT
+    WITH CHECK (
+        submitted_by IN (SELECT id FROM public.users WHERE auth_user_id = auth.uid())
+    );
+
+CREATE POLICY "Admins manage feedback queue"
+    ON public.feedback_samples FOR UPDATE
+    USING (public.is_admin());

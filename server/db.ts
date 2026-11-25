@@ -87,6 +87,21 @@ export interface DbActivity {
   created_at: string;
 }
 
+export interface DbFeedbackSample {
+  id: string;
+  prediction_id: string | null;
+  submitted_by: string | null;
+  email_subject: string;
+  sender_address: string | null;
+  email_content: string;
+  original_prediction: 'SPAM' | 'HAM';
+  corrected_label: 'SPAM' | 'HAM';
+  notes: string | null;
+  status: 'pending' | 'applied' | 'dismissed';
+  created_at: string;
+  applied_at: string | null;
+}
+
 let dbInstance: DatabaseSync | null = null;
 
 const isVercel = Boolean(process.env.VERCEL);
@@ -195,6 +210,23 @@ export function getDb(
     );
 
     CREATE INDEX IF NOT EXISTS idx_activity_created ON user_activity(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS feedback_samples (
+      id TEXT PRIMARY KEY,
+      prediction_id TEXT,
+      submitted_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+      email_subject TEXT NOT NULL DEFAULT '(No Subject)',
+      sender_address TEXT,
+      email_content TEXT NOT NULL,
+      original_prediction TEXT NOT NULL CHECK (original_prediction IN ('SPAM', 'HAM')),
+      corrected_label TEXT NOT NULL CHECK (corrected_label IN ('SPAM', 'HAM')),
+      notes TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'dismissed')),
+      created_at TEXT NOT NULL,
+      applied_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_feedback_status_created ON feedback_samples(status, created_at DESC);
   `);
 
   dbInstance = db;
@@ -463,6 +495,49 @@ export function seedInitialDataIfEmpty(db: DatabaseSync, pipeline: TrainedPipeli
         ts
       );
     }
+  }
+
+  // Seed realistic Active Learning human-in-the-loop feedback queue if empty
+  const feedbackCount = (db.prepare('SELECT COUNT(*) as cnt FROM feedback_samples').get() as { cnt: number }).cnt;
+  if (feedbackCount === 0 && analystId && adminId) {
+    const insertFb = db.prepare(`
+      INSERT INTO feedback_samples (
+        id, prediction_id, submitted_by, email_subject, sender_address,
+        email_content, original_prediction, corrected_label, notes, status, created_at, applied_at
+      ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const sixHoursAgo = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+    const twoDaysAgo = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    const oneDayAgo = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+    insertFb.run(
+      crypto.randomUUID(),
+      analystId,
+      'Vendor Security Audit: Annual SOC2 Receipt & Invoice Discount Notice',
+      'compliance@trustedvendor.org',
+      'Hello team, please find attached our annual SOC2 Type II compliance report and 10% early renewal credit notice for Q4 infrastructure billing.',
+      'SPAM',
+      'HAM',
+      'False positive triggered by "10% discount" and "invoice" phrasing from verified vendor.',
+      'pending',
+      sixHoursAgo,
+      null
+    );
+
+    insertFb.run(
+      crypto.randomUUID(),
+      adminId,
+      'Payroll Direct Deposit Confirmation Required Before 5 PM',
+      'hr-portal@payroll-sync-update.info',
+      'Employees must re-validate their bank routing number and portal password using the external benefits link before tonight.',
+      'HAM',
+      'SPAM',
+      'Subtle credential harvest spear-phish flagged during SOC triage.',
+      'applied',
+      twoDaysAgo,
+      oneDayAgo
+    );
   }
 }
 

@@ -186,29 +186,29 @@ export function DashboardPage() {
         )}
       </div>
 
-      {/* Zero-API-Key AI Capabilities Strip */}
+      {/* Zero-API-Key AI & ML Capabilities Strip */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <Link
           to="/detect"
           className="p-5 rounded-xl bg-slate-900/70 border border-slate-800 hover:border-indigo-500/40 transition-colors space-y-2"
         >
           <p className="font-display text-sm font-semibold text-white">
-            01. Phishing &amp; Sentence Forensics
+            01. Header &amp; Threat Forensics
           </p>
           <p className="text-xs text-slate-400 leading-relaxed">
-            Inspect brand impersonation alerts, suspicious URL TLDs, social engineering urgency scores, and sentence-by-sentence risk ratings.
+            Inspect SPF/DKIM/DMARC authentication headers, Reply-To spoofing, sentence-level risk, Soft-Voting Ensemble consensus, and export JSON or printable SOC briefs.
           </p>
         </Link>
 
         <Link
-          to="/detect"
+          to="/models"
           className="p-5 rounded-xl bg-slate-900/70 border border-slate-800 hover:border-indigo-500/40 transition-colors space-y-2"
         >
           <p className="font-display text-sm font-semibold text-white">
-            02. Batch Multi-Email CSV Scanner
+            02. Live ROC &amp; Feature Explorer
           </p>
           <p className="text-xs text-slate-400 leading-relaxed">
-            Upload or paste up to 50 emails in one pass to classify threat categories, urgency scores, and export labeled CSV audit sheets.
+            Tune decision thresholds against real held-out ROC curves, simulate confusion matrices in real time, and inspect global SPAM vs. HAM TF-IDF n-gram coefficients.
           </p>
         </Link>
 
@@ -217,10 +217,10 @@ export function DashboardPage() {
           className="p-5 rounded-xl bg-slate-900/70 border border-slate-800 hover:border-indigo-500/40 transition-colors space-y-2"
         >
           <p className="font-display text-sm font-semibold text-white">
-            03. AI Gatekeeper &amp; Reply Coach
+            03. Active Learning &amp; AI Gatekeeper
           </p>
           <p className="text-xs text-slate-400 leading-relaxed">
-            Send client-to-client mail or test inbound webhooks with automatic Spam Quarantine routing and 1-click safe reply drafts.
+            Flag misclassified predictions for human-in-the-loop model retraining, scan batches of 50 emails, or send client mail routed through automatic Spam Quarantine.
           </p>
         </Link>
       </div>
